@@ -11,6 +11,20 @@ def test_operating_sample_through_receipt_reconcile():
     assert batch == run(40)
 
 
+def test_selected_training_window_drives_live_forecast_and_band():
+    batch = run(40)
+    selection = {row["商品"]: row["训练窗口"]
+                 for row in batch["stages"][2]["records"] if "短窗可用日" in row}
+    assert selection
+    current = {row["lot"]: row["sku"] for row in batch["stages"][4]["records"] if "sku" in row}
+    forecasts = [row for row in batch["stages"][2]["records"] if "校准半径" in row]
+    assert all(row["训练窗口"] == selection[current[row["lot"]]] for row in forecasts)
+    band = {row["商品"]: row for row in batch["stages"][3]["records"]}
+    assert all(band[sku]["训练窗口"] == window for sku, window in selection.items())
+    short = [row for row in forecasts if row["训练窗口"] == "短窗"]
+    assert short and all(row["训练样本"] <= 7 for row in short)
+
+
 def test_change_allowance_produces_new_audit_record():
     restricted = run(1)
     open_budget = run(100)

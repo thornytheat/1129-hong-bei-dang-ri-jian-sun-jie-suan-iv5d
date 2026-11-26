@@ -30,15 +30,19 @@ def read_documents(folder: Path, filename: str):
     return rows, sha256(raw).hexdigest()
 
 
-def assess_model(history, prior_day, product, coverage):
-    # 训练、回放和待决当天严格按业务日分离。
-    training_day = prior_day - 5
-    baseline = demand.fit(history, training_day, product=product)
+def assess_model(history, prior_day, product, coverage, window):
+    # 训练与校准按业务日分开：留给校准的实销不进训练。
+    training_day = prior_day - demand.CALIBRATION_DAYS
+    curve, source = demand.fit(history, training_day, product=product), "长窗"
+    if window == "短窗":
+        recent = demand.short_window_sample(history, training_day, product=product)
+        if len(recent) >= demand.MIN_SHORT_SAMPLES:
+            curve, source = demand.curve_for(recent), "短窗"
     validation_samples = [row for row in demand.chronological_sample(history, prior_day)
                           if row.sku == product and row.day >= training_day]
-    points = [(row.late_sales, demand.one(baseline, demand.points(row))) for row in validation_samples]
+    points = [(row.late_sales, demand.one(curve, demand.points(row))) for row in validation_samples]
     band = uncertainty.validate(points, coverage=coverage)
-    return baseline, band
+    return curve, band, source
 
 
 def run(capacity: int | None = None, *, dataset: Path | None = None) -> dict:
@@ -56,12 +60,21 @@ def run(capacity: int | None = None, *, dataset: Path | None = None) -> dict:
     usable = [inventory.sellable(ticket.lot, ticket.baked, balances.get(ticket.lot, {})) for ticket in current]
     totals = inventory.evidence_totals(usable)
     forecasts, proposals = [], []
-    training = {sku: assess_model(history.records, config["day"], sku, config["coverage"])
-                for sku in sorted({ticket.sku for ticket in current})}
+    trials, denied = demand.recent_replay(
+        history.records, config["day"],
+        {(ticket.station, ticket.sku) for ticket in current}, 6
+    )
+    decisions = demand.window_selection(trials)
+    selected = {row["商品"]: row["训练窗口"] for row in decisions}
+    training = {
+        sku: assess_model(history.records, config["day"], sku, config["coverage"],
+                          selected.get(sku, "长窗"))
+        for sku in sorted({ticket.sku for ticket in current})
+    }
     for ticket, stock in zip(current, usable, strict=True):
         if stock["variance"]:
             continue
-        curve, band = training[ticket.sku]
+        curve, band, window = training[ticket.sku]
         remaining = ovens.lot_clock(ticket, config["minute"])["minutes_left"]
         vector = (stock["sellable"], remaining, config["day"] % 7, config["rain_mm"])
         estimate = demand.one(curve, vector)
@@ -69,7 +82,8 @@ def run(capacity: int | None = None, *, dataset: Path | None = None) -> dict:
         measured = uncertainty.StockForecast.parse({"lot": ticket.lot, "available": stock["sellable"], "forecast": estimate,
                     "distance": distance, "shelf_remaining": remaining, "price_cents": ticket.price_cents})
         result = uncertainty.proposal(measured, band)
-        forecasts.append({**result, "训练样本": curve.count, "校准样本": band.observed, "校准半径": round(band.radius, 2)})
+        forecasts.append({**result, "训练窗口": window, "训练样本": curve.count,
+                          "校准样本": band.observed, "校准半径": round(band.radius, 2)})
         proposals.append({**result, "station": ticket.station, "sku": ticket.sku,
                           "available": stock["sellable"], "markdown_pct": config["markdown_pct"]})
     requests = approvals.inspect(proposals)
@@ -88,17 +102,13 @@ def run(capacity: int | None = None, *, dataset: Path | None = None) -> dict:
         requests.records, budget * 100, config["per_counter_sku"]
     )
     comparison = approvals.discount_breakdown(requests.records, rows, diagnostics)
-    trials, denied = demand.recent_replay(
-        history.records, config["day"],
-        {(ticket.station, ticket.sku) for ticket in current}, 6
-    )
     replay = demand.replay_summary(trials)
     transfer_check = demand.replay_held_stations(history.records, config["day"])
     stages = [
         stage("炉次流水", f"截止前仍可售 {len(current)} 炉，需查 {len(current_errors) + len(intake.rejected)} 条", [ovens.lot_clock(ticket, config["minute"]) for ticket in current] + current_errors + [x.evidence() for x in intake.rejected]),
         stage("损耗核算", f"已处理 {ledger.read_count} 条变动，报损及捐赠 {totals['disposed']} 件", usable + ledger_errors),
-        stage("余货拟合", f"按 {len(training)} 种商品独立拟合尾段销量", forecasts + replay + transfer_check + denied),
-        stage("折价区间", f"批准前核对 {len(forecasts)} 个区间和历史距离", [{"商品": sku, **uncertainty.summarize(model[1])} for sku, model in training.items()]),
+        stage("余货拟合", f"按 {len(training)} 种商品独立拟合尾段销量，{sum(row['训练窗口'] == '短窗' for row in decisions)} 种采用短窗", forecasts + decisions + replay + transfer_check + denied),
+        stage("折价区间", f"批准前核对 {len(forecasts)} 个区间和历史距离", [{"商品": sku, "训练窗口": model[2], **uncertainty.summarize(model[1])} for sku, model in training.items()]),
         stage("促销限量", f"按 ¥{budget} 上限预留 ¥{used/100:.2f}", rows + [diagnostics.evidence()] + comparison + approvals.stock_movements(rows)),
         stage("日结汇总", f"{receipts_summary['approved']} 张收据验证通过，{receipts_summary['exceptions']} 张待查", receipts + [line.evidence() for line in cashbook] + coupon_issues),
     ]

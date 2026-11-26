@@ -4,7 +4,7 @@ from math import isclose
 import pytest
 
 from bakerylot.leftover_curve import service as demand
-from bakerylot.leftover_curve.replay import Trial, masked_station
+from bakerylot.leftover_curve.replay import Trial, masked_station, window_selection
 from bakerylot.pipeline import run
 
 
@@ -120,3 +120,75 @@ def test_censored_sales_never_create_a_perfect_baseline():
     second = demand.recent_replay(sample+[corrected], 20, {("南柜", "碱水")}, 5)
     assert first == second
     assert len(first[0]) == 5
+
+
+def trial(sku, day, *, long_error, long_missed, short_error, short_missed, short_samples, total=1):
+    return Trial(sku=sku, day=day, total=total, baseline_error=0.0, model_error=long_error,
+                 missed_stock=long_missed, soldout=0, short_error=short_error,
+                 short_missed=short_missed, short_samples=short_samples)
+
+
+def test_short_window_only_wins_when_error_drops_without_more_under_prediction():
+    cases = [
+        trial("甲", 10, long_error=4.0, long_missed=1, short_error=3.0, short_missed=1, short_samples=7),
+        trial("丙", 10, long_error=4.0, long_missed=1, short_error=2.0, short_missed=2, short_samples=7),
+        trial("丁", 10, long_error=2.0, long_missed=0, short_error=3.0, short_missed=0, short_samples=7),
+    ]
+    selection = {row["商品"]: row for row in window_selection(cases)}
+    assert selection["甲"]["训练窗口"] == "短窗"
+    assert selection["丙"]["训练窗口"] == "长窗"
+    assert selection["丁"]["训练窗口"] == "长窗"
+
+
+def test_short_window_with_fewer_than_four_samples_falls_back_to_long():
+    case = trial("戊", 10, long_error=4.0, long_missed=1, short_error=None,
+                 short_missed=None, short_samples=3)
+    row, = window_selection([case])
+    assert row["训练窗口"] == "长窗"
+    assert row["短窗可用日"] == 0
+    assert row["短窗平均绝对误差"] == row["长窗平均绝对误差"]
+    assert row["短窗低估炉次"] == row["长窗低估炉次"]
+
+
+def test_both_windows_are_scored_on_the_same_held_out_lots():
+    # 同一批留出炉次既进长窗误差，也进短窗误差；短窗训练样本严格来自最近一周。
+    samples = receipts()
+    outcome, _ = demand.recent_replay(samples, 20, {("北柜", "青麦")}, 6)
+    assert all(line.short_samples <= 7 for line in outcome)
+    assert all(line.short_samples >= 4 for line in outcome)
+    row, = window_selection(outcome)
+    assert row["回放炉次"] == sum(line.total for line in outcome)
+    assert row["短窗平均绝对误差"] != row["长窗平均绝对误差"]
+
+
+def test_short_window_does_not_learn_calibration_or_future_sales():
+    samples = receipts()
+    kept = {("北柜", "青麦")}
+    baseline = demand.recent_replay(samples, 20, kept, 6)
+    # 回放日 19 的短窗取 12-18 日；把 19 日之后的实销改大不应影响它。
+    future = replace(samples[-1], historical_lot="未来", day=25, observed_day=25, late_sales=40)
+    edited = demand.recent_replay(samples + [future], 20, kept, 6)
+    assert edited == baseline
+
+
+def history(*, days=27, sku="青麦"):
+    return [demand.DailyFinish.parse({
+        "historical_lot": f"L{day:02}", "day": day, "station": "北柜", "sku": sku,
+        "remaining": 20 + day % 5, "minutes": 20 + day * 3, "late_sales": 4 + day // 3,
+        "daypart": day % 7, "rain_mm": float(day % 4), "censored": 0, "observed_day": day,
+    }) for day in range(1, days + 1)]
+
+
+def test_calibration_sales_stay_out_of_training_but_still_set_the_band():
+    # 校准实销不进训练：改动校准段（第 23–27 日）只改半径，不改曲线。
+    from bakerylot.pipeline import assess_model
+    rows = history(days=27)
+    for window in ("长窗", "短窗"):
+        curve, band, source = assess_model(rows, 28, "青麦", 0.8, window)
+        assert source == window
+        edited = [replace(row, late_sales=30) if row.day == 25 else row for row in rows]
+        curve2, band2, _ = assess_model(edited, 28, "青麦", 0.8, window)
+        assert curve2 == curve
+        assert band2 != band
+        trained = [replace(row, late_sales=30) if row.day == 22 else row for row in rows]
+        assert assess_model(trained, 28, "青麦", 0.8, window)[0] != curve

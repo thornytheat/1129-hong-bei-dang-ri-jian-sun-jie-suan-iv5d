@@ -5,6 +5,10 @@ from .contracts import DailyFinish
 
 
 FEATURES = ("remaining", "minutes", "daypart", "rain_mm")
+SHORT_WINDOW_DAYS = 7
+MIN_SHORT_SAMPLES = 4
+CALIBRATION_DAYS = 5
+MIN_TRAINING_SAMPLES = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,9 +31,13 @@ def center_scale(values: list[float]) -> tuple[float, float]:
     return mean, sqrt(variance) if variance > 1e-12 else 1.0
 
 
+def visible_history(history, cut_day: int):
+    return [row for row in history if row.day < cut_day and row.observed_day < cut_day
+            and not row.censored and row.late_sales <= row.remaining]
+
+
 def chronological_sample(history, cut_day: int, *, product: str | None = None):
-    visible = [row for row in history if row.day < cut_day and row.observed_day < cut_day
-               and not row.censored and row.late_sales <= row.remaining]
+    visible = visible_history(history, cut_day)
     if product:
         matching = [row for row in visible if row.sku == product]
         if len(matching) >= 12:
@@ -37,11 +45,21 @@ def chronological_sample(history, cut_day: int, *, product: str | None = None):
     return sorted(visible, key=lambda row: (row.day, row.historical_lot))
 
 
-def fit(history, cut_day: int, *, product=None, penalty: float = 0.10) -> Curve:
+def short_window_sample(history, cut_day: int, *, product: str,
+                        window: int = SHORT_WINDOW_DAYS):
+    if window < 1:
+        raise ValueError("WINDOW_INVALID")
+    return sorted(
+        (row for row in visible_history(history, cut_day)
+         if row.sku == product and cut_day - window <= row.day < cut_day),
+        key=lambda row: (row.day, row.historical_lot),
+    )
+
+
+def curve_for(sequence, *, penalty: float = 0.10) -> Curve:
     if penalty < 0:
         raise ValueError("PENALTY_NEGATIVE")
-    sequence = chronological_sample(history, cut_day, product=product)
-    if len(sequence) < 4:
+    if len(sequence) < MIN_TRAINING_SAMPLES:
         raise ValueError("HISTORY_TOO_SMALL")
     raw = [points(row) for row in sequence]
     moments = tuple(center_scale(list(values)) for values in zip(*raw, strict=True))
@@ -58,6 +76,10 @@ def fit(history, cut_day: int, *, product=None, penalty: float = 0.10) -> Curve:
             direction = fsum(x[j] * error for x, error in zip(inputs, gradient, strict=True)) / len(sequence)
             weights[j] = weight - 0.10 * (direction + penalty * weight)
     return Curve(intercept, tuple(weights), moments, len(target))
+
+
+def fit(history, cut_day: int, *, product=None, penalty: float = 0.10) -> Curve:
+    return curve_for(chronological_sample(history, cut_day, product=product), penalty=penalty)
 
 
 def one(curve: Curve, values: tuple[float, ...]) -> float:
